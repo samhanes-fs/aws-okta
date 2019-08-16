@@ -11,6 +11,12 @@ type OktaStateToken struct {
 	PassCode   string `json:"passCode"`
 }
 
+type OktaU2fResponse struct {
+	StateToken    string `json:"stateToken"`
+	ClientData    string `json:"clientData"`
+	SignatureData string `json:"signatureData"`
+}
+
 type OktaUserAuthn struct {
 	StateToken   string                `json:"stateToken"`
 	SessionToken string                `json:"sessionToken"`
@@ -29,11 +35,23 @@ type OktaUserAuthnFactor struct {
 	Id         string                      `json:"id"`
 	FactorType string                      `json:"factorType"`
 	Provider   string                      `json:"provider"`
+	Profile    OktaUserAuthnFactorProfile  `json:"profile"`
 	Embedded   OktaUserAuthnFactorEmbedded `json:"_embedded"`
 }
 
+type OktaUserAuthnFactorProfile struct {
+	CredentialId string `json:"credentialId"`
+	AppId        string `json:"appId"`
+}
+
 type OktaUserAuthnFactorEmbedded struct {
+	Challenge OktaUserAuthnFactorEmbeddedChallenge `json:"challenge"`
 	Verification OktaUserAuthnFactorEmbeddedVerification `json:"verification"`
+}
+
+type OktaUserAuthnFactorEmbeddedChallenge struct {
+	Nonce          string `json:"nonce"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
 }
 
 type OktaUserAuthnFactorEmbeddedVerification struct {

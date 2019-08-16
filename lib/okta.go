@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/segmentio/aws-okta/lib/saml"
+	u2fhost "github.com/marshallbrekka/go-u2fhost"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -335,55 +336,86 @@ func (o *OktaClient) preChallenge(oktaFactorId, oktaFactorType string) ([]byte, 
 	return payload, nil
 }
 
-func (o *OktaClient) postChallenge(payload []byte, oktaFactorProvider string, oktaFactorId string) error {
+func (o *OktaClient) postChallenge(payload []byte) error {
 	//Initiate Push Notification
 	if o.UserAuth.Status == "MFA_CHALLENGE" {
 		f := o.UserAuth.Embedded.Factor
 		errChan := make(chan error, 1)
 
-		if oktaFactorProvider == "DUO" {
-			// Contact the Duo to initiate Push notification
-			if f.Embedded.Verification.Host != "" {
-				o.DuoClient = &DuoClient{
-					Host:       f.Embedded.Verification.Host,
-					Signature:  f.Embedded.Verification.Signature,
-					Callback:   f.Embedded.Verification.Links.Complete.Href,
-					Device:     o.MFAConfig.DuoDevice,
-					StateToken: o.UserAuth.StateToken,
-				}
+		if f.FactorType == "u2f" {
+			response, err := promptU2f(
+				&u2fhost.AuthenticateRequest{
+					AppId: f.Profile.AppId,
+					Facet: f.Profile.AppId,
+					KeyHandle: f.Profile.CredentialId,
+					Challenge: f.Embedded.Challenge.Nonce,
+				},
+				f.Embedded.Challenge.TimeoutSeconds,
+			)
+			if err != nil {
+				return err
+			}
 
-				log.Debugf("Host:%s\nSignature:%s\nStateToken:%s\n",
-					f.Embedded.Verification.Host, f.Embedded.Verification.Signature,
-					o.UserAuth.StateToken)
+			payload, err := json.Marshal(OktaU2fResponse{
+				StateToken: o.UserAuth.StateToken,
+				ClientData: response.ClientData,
+				SignatureData: response.SignatureData,
+			})
+			if err != nil {
+				return err
+			}
 
-				go func() {
-					log.Debug("challenge u2f")
-					log.Info("Sending Push Notification...")
-					err := o.DuoClient.ChallengeU2f(f.Embedded.Verification.Host)
-					if err != nil {
-						errChan <- err
+			err = o.Get("POST", "api/v1/authn/factors/"+f.Id+"/verify",
+				payload, &o.UserAuth, "json",
+			)
+			if err != nil {
+				return fmt.Errorf("Failed U2F verification for okta. Err: %s", err)
+			}
+		} else if f.FactorType == "web" {
+			if f.Provider == "DUO" {
+				// Contact the Duo to initiate Push notification
+				if f.Embedded.Verification.Host != "" {
+					o.DuoClient = &DuoClient{
+						Host:       f.Embedded.Verification.Host,
+						Signature:  f.Embedded.Verification.Signature,
+						Callback:   f.Embedded.Verification.Links.Complete.Href,
+						Device:     o.MFAConfig.DuoDevice,
+						StateToken: o.UserAuth.StateToken,
 					}
-				}()
-			}
-		}
 
-		// Poll Okta until authentication has been completed
-		for o.UserAuth.Status != "SUCCESS" {
-			select {
-			case duoErr := <-errChan:
-				log.Printf("Err: %s", duoErr)
-				if duoErr != nil {
-					return fmt.Errorf("Failed Duo challenge. Err: %s", duoErr)
-				}
-			default:
-				err := o.Get("POST", "api/v1/authn/factors/"+oktaFactorId+"/verify",
-					payload, &o.UserAuth, "json",
-				)
-				if err != nil {
-					return fmt.Errorf("Failed authn verification for okta. Err: %s", err)
+					log.Debugf("Host:%s\nSignature:%s\nStateToken:%s\n",
+						f.Embedded.Verification.Host, f.Embedded.Verification.Signature,
+						o.UserAuth.StateToken)
+
+					go func() {
+						log.Debug("challenge u2f")
+						log.Info("Sending Push Notification...")
+						err := o.DuoClient.ChallengeU2f(f.Embedded.Verification.Host)
+						if err != nil {
+							errChan <- err
+						}
+					}()
 				}
 			}
-			time.Sleep(2 * time.Second)
+
+			// Poll Okta until authentication has been completed
+			for o.UserAuth.Status != "SUCCESS" {
+				select {
+				case duoErr := <-errChan:
+					log.Printf("Err: %s", duoErr)
+					if duoErr != nil {
+						return fmt.Errorf("Failed Duo challenge. Err: %s", duoErr)
+					}
+				default:
+					err := o.Get("POST", "api/v1/authn/factors/"+f.Id+"/verify",
+						payload, &o.UserAuth, "json",
+					)
+					if err != nil {
+						return fmt.Errorf("Failed authn verification for okta. Err: %s", err)
+					}
+				}
+				time.Sleep(2 * time.Second)
+			}
 		}
 	}
 	return nil
@@ -427,7 +459,7 @@ func (o *OktaClient) challengeMFA() (err error) {
 	}
 
 	//Handle Push Notification
-	err = o.postChallenge(payload, oktaFactorProvider, oktaFactorId)
+	err = o.postChallenge(payload)
 	if err != nil {
 		return err
 	}
@@ -443,6 +475,8 @@ func GetFactorId(f *OktaUserAuthnFactor) (id string, err error) {
 	case "token:hardware":
 		id = f.Id
 	case "sms":
+		id = f.Id
+	case "u2f":
 		id = f.Id
 	case "push":
 		if f.Provider == "OKTA" || f.Provider == "DUO" {
